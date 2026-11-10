@@ -94,8 +94,16 @@ function setup(app, resuming) {
 
 async function openMic() {
   if (mic) return mic;
-  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  // Created before the first await, while the click still counts as a user gesture (Safari, iOS).
   const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) {
+    ctx.close().catch(() => {});
+    throw e;
+  }
   const src = ctx.createMediaStreamSource(stream);
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 1024;
@@ -192,12 +200,14 @@ function recorderFor(stream) {
 async function begin(app, resuming) {
   const st = store.state;
   const s = st.speaking;
+  // Still inside the start click: unlock sound output now, so that every later prompt can play (Safari, iOS).
+  const player = new Audio();
+  const unlocked = unlock(player);
+  if (mic && mic.ctx.state === 'suspended') mic.ctx.resume().catch(() => {});
   if (!resuming) { s.status = 'active'; s.startedAt = Date.now(); s.idx = 0; s.items = {}; }
   else s.interruptions = (s.interruptions || 0) + 1;
   store.save();
-  if (mic && mic.ctx.state === 'suspended') await mic.ctx.resume();
 
-  const player = new Audio();
   let leaving = false;
   let finishTurn = null;
 
@@ -225,6 +235,7 @@ async function begin(app, resuming) {
   const showQ = h('button', { class: 'btn ghost small', type: 'button', hidden: true }, 'Afficher la question');
   const doneBtn = h('button', { class: 'btn primary big', type: 'button', disabled: true, onclick: () => finishTurn && finishTurn('done') }, 'J’ai fini de répondre');
   const prepBtn = h('button', { class: 'btn primary big', type: 'button', hidden: true }, 'Je suis prêt·e à parler');
+  const playBtn = h('button', { class: 'btn primary big', type: 'button', hidden: true }, '▶ Écouter l’examinatrice');
   const hint = h('p', { class: 'sp-hint small muted' }, '');
 
   const stage = h('div', { class: 'speak' },
@@ -233,7 +244,7 @@ async function begin(app, resuming) {
     h('div', { class: 'speak-stage' },
       h('div', { class: 'speakers' }, examiner, you),
       card, notes, question,
-      h('div', { class: 'speak-actions' }, showQ, prepBtn, doneBtn),
+      h('div', { class: 'speak-actions' }, playBtn, showQ, prepBtn, doneBtn),
       hint));
   app.screen(stage, true);
 
@@ -256,10 +267,25 @@ async function begin(app, resuming) {
       hint.textContent = 'Écoute la question.';
       youClock.textContent = '';
       player.src = promptURLs[promptId] || `audio/speaking/${promptId}.mp3`;
-      const end = () => { examiner.classList.remove('speaking'); examiner.querySelector('.speaker-state').textContent = ''; resolve(); };
+      let ended = false;
+      const end = () => {
+        if (ended) return;
+        ended = true;
+        playBtn.hidden = true;
+        examiner.classList.remove('speaking');
+        examiner.querySelector('.speaker-state').textContent = '';
+        resolve();
+      };
       player.onended = end;
       player.onerror = () => setTimeout(end, 400);
-      player.play().catch(() => setTimeout(end, 400));
+      player.play().catch(err => {
+        if (!err || err.name !== 'NotAllowedError') { setTimeout(end, 400); return; }
+        // The browser still blocks sound: let the candidate start the prompt with a tap.
+        hint.textContent = 'Ton navigateur bloque le son : appuie pour écouter l’examinatrice.';
+        playBtn.hidden = false;
+        playBtn.focus();
+        playBtn.onclick = () => { playBtn.hidden = true; player.play().catch(() => setTimeout(end, 400)); };
+      });
     });
   }
 
@@ -298,6 +324,7 @@ async function begin(app, resuming) {
     return { reason, duration: round1(duration), ...v, text: r.text, conf: r.conf, srError: r.error, blob };
   }
 
+  await unlocked;
   for (let i = s.idx; i < SPEAKING_STEPS.length; i++) {
     if (leaving) return;
     const step = SPEAKING_STEPS[i];
@@ -362,6 +389,32 @@ async function begin(app, resuming) {
   store.save();
   closeMic();
   app.sectionDone('speaking');
+}
+
+// 0.1 s of silence, played during the start click so the browser allows the examiner's later prompts.
+let silentURL = null;
+function silentClip() {
+  if (silentURL) return silentURL;
+  const rate = 8000, n = 800, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const str = (o, txt) => { for (let i = 0; i < txt.length; i++) v.setUint8(o + i, txt.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, n * 2, true);
+  silentURL = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+  return silentURL;
+}
+
+function unlock(player) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = () => { if (done) return; done = true; player.onended = null; resolve(); };
+    player.onended = finish;
+    player.src = silentClip();
+    const p = player.play();
+    if (p && p.catch) p.catch(finish);
+    setTimeout(finish, 1500);
+  });
 }
 
 function closeMic() {

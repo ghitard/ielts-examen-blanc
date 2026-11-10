@@ -101,12 +101,30 @@ function runExam(app, resuming) {
   audio.preload = 'auto';
   audio.volume = Number(localStorage.getItem('ielts-volume') || 1);
 
+  // One overlay for two cases: the browser refused to start the sound (not an interruption),
+  // or playback stopped mid-test (call, screen lock…), which is counted in the report.
+  let blocked = false;
+  const overlayTitle = h('h2', {});
+  const overlayText = h('p', {});
+  const overlayBtn = h('button', { class: 'btn primary', onclick: () => {
+    overlay.hidden = true;
+    if (!blocked) { s.interruptions = (s.interruptions || 0) + 1; store.save(); }
+    blocked = false;
+    audio.play().catch(err => { if (err && err.name === 'NotAllowedError') showOverlay(true); });
+  } });
   const overlay = h('div', { class: 'exam-overlay', hidden: true },
-    h('div', { class: 'dialog' },
-      h('h2', {}, 'The recording has stopped'),
-      h('p', {}, 'L’enregistrement a été interrompu (appel, verrouillage de l’écran…). Reprends dès que possible.'),
-      h('div', { class: 'dialog-actions' }, h('button', { class: 'btn primary', onclick: () => { overlay.hidden = true; s.interruptions = (s.interruptions || 0) + 1; audio.play(); } }, 'Resume'))));
+    h('div', { class: 'dialog' }, overlayTitle, overlayText, h('div', { class: 'dialog-actions' }, overlayBtn)));
   shell.el.append(overlay);
+  function showOverlay(isBlocked) {
+    blocked = isBlocked;
+    overlayTitle.textContent = isBlocked ? 'Start the recording' : 'The recording has stopped';
+    overlayText.textContent = isBlocked
+      ? 'Ton navigateur demande une confirmation avant de lancer le son.'
+      : 'L’enregistrement a été interrompu (appel, verrouillage de l’écran…). Reprends dès que possible.';
+    overlayBtn.textContent = isBlocked ? 'Start' : 'Resume';
+    overlay.hidden = false;
+    overlayBtn.focus();
+  }
 
   function showPart(id) {
     shownPart = id;
@@ -147,8 +165,8 @@ function runExam(app, resuming) {
   });
   audio.addEventListener('ended', startReview);
   audio.addEventListener('pause', () => {
-    if (expectedPause || finished || audio.ended || reviewLeft != null) return;
-    overlay.hidden = false;
+    if (expectedPause || finished || audio.ended || reviewLeft != null || blocked) return;
+    showOverlay(false);
   });
   audio.addEventListener('error', () => {
     dialog({ title: 'Problème audio', body: 'L’enregistrement n’a pas pu être lu. Vérifie ta connexion puis réessaie.', actions: [{ label: 'Réessayer', value: 1, kind: 'primary' }] })
@@ -195,11 +213,13 @@ function runExam(app, resuming) {
 
   showPart(shownPart);
   if (s.status === 'review') { startReview(); return; }
-  const begin = () => {
-    try { audio.currentTime = s.audioPos || 0; } catch (e) { /* metadata not ready */ }
-    audio.play().catch(() => { overlay.hidden = false; });
-  };
-  if (audio.readyState >= 1) begin(); else audio.addEventListener('loadedmetadata', begin, { once: true });
+  // play() is called during the click that opened the test: Safari and iOS refuse sound started later.
+  const startAt = s.audioPos || 0;
+  if (startAt > 0) {
+    const seek = () => { try { audio.currentTime = startAt; } catch (e) { /* not seekable yet */ } };
+    if (audio.readyState >= 1) seek(); else audio.addEventListener('loadedmetadata', seek, { once: true });
+  }
+  audio.play().catch(err => { if (err && err.name === 'NotAllowedError') showOverlay(true); });
   tick();
 }
 
